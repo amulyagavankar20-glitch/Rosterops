@@ -1,0 +1,53 @@
+services:
+  db:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:-rosterops}
+      POSTGRES_USER: ${POSTGRES_USER:-rosterops}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD in .env}
+    volumes:
+      - roster_pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-rosterops} -d ${POSTGRES_DB:-rosterops}"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+    networks: [roster-net]
+
+  api:
+    build: .
+    restart: unless-stopped
+    command: uvicorn app.main:app --host 0.0.0.0 --port 8000
+    env_file: .env
+    environment:
+      APP_ENV: ${APP_ENV:-production}
+      DATABASE_URL: postgresql+psycopg2://${POSTGRES_USER:-rosterops}:${POSTGRES_PASSWORD}@db:5432/${POSTGRES_DB:-rosterops}
+      SEED_DEMO_DATA: ${SEED_DEMO_DATA:-true}
+      CORS_ORIGINS: ${CORS_ORIGINS:-http://localhost:8501}
+    depends_on:
+      db: {condition: service_healthy}
+    ports: ["${API_PORT:-8000}:8000"]
+    networks: [roster-net]
+
+  frontend:
+    build: .
+    restart: unless-stopped
+    command: streamlit run streamlit_app.py --server.address 0.0.0.0 --server.port 8501 --server.headless true
+    env_file: .env
+    environment:
+      API_BASE_URL: http://api:8000
+      APP_ENV: ${APP_ENV:-production}
+      DATABASE_URL: postgresql+psycopg2://${POSTGRES_USER:-rosterops}:${POSTGRES_PASSWORD}@db:5432/${POSTGRES_DB:-rosterops}
+    depends_on:
+      api: {condition: service_healthy}
+    healthcheck:
+      disable: true
+    ports: ["${FRONTEND_PORT:-8501}:8501"]
+    networks: [roster-net]
+
+volumes:
+  roster_pgdata:
+networks:
+  roster-net:
+    driver: bridge
