@@ -287,6 +287,10 @@ with tabs[3]:
                         if r: st.success(f"Created {r['name']}"); st.rerun()
     st.markdown("#### Create employee-to-process assignment")
     processes=[(b,p) for b in brands for p in b["processes"]]
+    assignment_rows=api("GET","/api/assignments") or []
+    if assignment_rows:
+        st.markdown("#### Current assignments")
+        st.dataframe(pd.DataFrame(assignment_rows),use_container_width=True,hide_index=True)
     if people and processes:
         with st.form("assign"):
             empmap={f"{e['name']} · #{e['id']}":e["id"] for e in people}; selected_emp=st.selectbox("Employee",list(empmap))
@@ -294,6 +298,30 @@ with tabs[3]:
             if st.form_submit_button("Add assignment"):
                 bid,pid=pmap[selected_proc]; r=api("POST","/api/assignments",json={"employee_id":empmap[selected_emp],"brand_id":bid,"process_id":pid,"is_primary":primary})
                 if r: st.success("Assignment created."); st.rerun()
+    if assignment_rows:
+        with st.expander("Edit or remove assignment"):
+            assignment_options={
+                f"{row['employee']} / {row['brand']} / {row['process']} · #{row['id']}": row
+                for row in assignment_rows
+            }
+            chosen_assignment=st.selectbox("Assignment",list(assignment_options),key="assignment_manage")
+            selected_assignment=assignment_options[chosen_assignment]
+            with st.form("edit_assignment"):
+                edit_empmap={f"{e['name']} · #{e['id']}":e["id"] for e in people}
+                current_emp=next((label for label, emp_id in edit_empmap.items() if emp_id == selected_assignment["employee_id"]), list(edit_empmap)[0])
+                edit_emp=st.selectbox("Employee",list(edit_empmap),index=list(edit_empmap).index(current_emp))
+                edit_pmap={f"{b['name']} / {p['name']}":(b["id"],p["id"]) for b,p in processes}
+                current_process=next((label for label, ids in edit_pmap.items() if ids == (selected_assignment["brand_id"],selected_assignment["process_id"])), list(edit_pmap)[0])
+                edit_process=st.selectbox("Brand / process",list(edit_pmap),index=list(edit_pmap).index(current_process))
+                edit_primary=st.checkbox("Primary assignment",selected_assignment["is_primary"])
+                save_edit=st.form_submit_button("Save assignment")
+            if save_edit:
+                bid,pid=edit_pmap[edit_process]
+                r=api("PUT",f"/api/assignments/{selected_assignment['id']}",json={"employee_id":edit_empmap[edit_emp],"brand_id":bid,"process_id":pid,"is_primary":edit_primary})
+                if r: st.success("Assignment updated."); st.rerun()
+            if st.button("Remove selected assignment",key="remove_assignment"):
+                r=api("DELETE",f"/api/assignments/{selected_assignment['id']}")
+                if r: st.success("Assignment removed."); st.rerun()
     with st.expander("Create a pod"):
         with st.form("create_pod"):
             pod_name=st.text_input("Pod name")

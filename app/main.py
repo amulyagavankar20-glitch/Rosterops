@@ -231,7 +231,16 @@ def manual_allocation(payload: ManualAllocationIn, db: Session = Depends(get_db)
 def update_assignment(assignment_id: int, payload: AssignmentIn, db: Session = Depends(get_db)):
     row=db.query(Assignment).filter(Assignment.id==assignment_id).first()
     if not row: raise HTTPException(404,"Assignment not found")
+    if not db.query(Employee).filter(Employee.id==payload.employee_id).first():
+        raise HTTPException(404,"Employee not found")
     if not db.query(Process).filter(Process.id==payload.process_id,Process.brand_id==payload.brand_id).first(): raise HTTPException(422,"Process does not belong to brand")
+    duplicate=db.query(Assignment).filter(
+        Assignment.employee_id==payload.employee_id,
+        Assignment.brand_id==payload.brand_id,
+        Assignment.process_id==payload.process_id,
+        Assignment.id != assignment_id,
+    ).first()
+    if duplicate: raise HTTPException(409,"Assignment already exists")
     for key,value in payload.model_dump().items(): setattr(row,key,value)
     db.commit(); return {"id":row.id,"status":"updated"}
 
@@ -258,7 +267,7 @@ def roster_allocations(year: int, month: int, db: Session = Depends(get_db)):
              "brand":r.brand.name,"brand_id":r.brand_id,"process":r.process.name,"process_id":r.process_id,
              "workload_units":r.workload_units} for r in rows]
 
-@app.post("/api/impact/leave")
+@app.post("/api/impact/leave", dependencies=[Depends(require_read_access)])
 def leave_impact(payload: ImpactIn, db: Session = Depends(get_db)):
     if payload.end_date < payload.start_date: raise HTTPException(422,"End date must be on or after start date")
     return analyze_leave_impact(db,payload.employee_id,payload.start_date,payload.end_date)

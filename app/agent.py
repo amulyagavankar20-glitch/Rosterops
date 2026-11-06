@@ -16,7 +16,13 @@ from langgraph.checkpoint.memory import MemorySaver
 from sqlalchemy.orm import Session
 
 from app.database import SessionLocal
-from app.scheduler import generate_roster, apply_leave_and_revalidate, get_roster_view, analyze_leave_impact
+from app.scheduler import (
+    generate_roster,
+    apply_leave_and_revalidate,
+    get_roster_view,
+    analyze_leave_impact,
+    get_backup_recommendations,
+)
 from app.models import Employee, Brand, Process, Assignment, Pod, Leave, LeaveRequest, RosterAllocation
 
 
@@ -150,7 +156,10 @@ def analyze_employee_absence(employee_name: str, start_date: str, end_date: str)
     try:
         emp = db.query(Employee).filter(Employee.name.ilike(f"%{employee_name}%")).first()
         if not emp: return f"Employee matching '{employee_name}' not found."
-        impact = analyze_leave_impact(db, emp.id, date.fromisoformat(start_date), date.fromisoformat(end_date))
+        start, end = date.fromisoformat(start_date), date.fromisoformat(end_date)
+        if end < start:
+            return "Invalid date range: end_date must be on or after start_date."
+        impact = analyze_leave_impact(db, emp.id, start, end)
         return str(impact)
     except ValueError:
         return "Dates must use YYYY-MM-DD format."
@@ -170,19 +179,14 @@ def recommend_backup_resources(brand_name: str, process_name: str, date_str: str
         day = date.fromisoformat(date_str)
         assigned_ids = {a.employee_id for a in db.query(Assignment).filter(Assignment.brand_id == brand.id).all()}
         pods = {e.pod_id for e in db.query(Employee).filter(Employee.id.in_(assigned_ids)).all()}
-        from collections import defaultdict
-        existing_load = defaultdict(int)
-        for allocation in db.query(RosterAllocation).filter(RosterAllocation.date == day).all():
-            existing_load[allocation.employee_id] += allocation.workload_units
-        leave_ids = {l.employee_id for l in db.query(Leave).filter(Leave.status == "approved", Leave.start_date <= day, Leave.end_date >= day).all()}
-        candidates = []
-        for emp in db.query(Employee).filter(Employee.pod_id.in_(pods)).all():
-            if emp.id in assigned_ids or emp.id in leave_ids: continue
-            load = existing_load[emp.id]
-            if load < max(1, emp.daily_capacity or 1):
-                candidates.append({"employee": emp.name, "employee_id": emp.id, "pod_id": emp.pod_id, "current_load": load, "capacity": emp.daily_capacity})
-        return str({"brand": brand.name, "process": process.name, "date": date_str, "backup_candidates": candidates[:5],
+        recommendations = get_backup_recommendations(db, brand.id, process.id, day, shortage=1)
+        return str({"brand": brand.name, "process": process.name, "date": date_str,
+                     "backup_candidates": recommendations.get("eligible", [])[:5],
+                     "potential_candidates": recommendations.get("potential", [])[:5],
+                     "rejected_candidates": recommendations.get("rejected", [])[:10],
                      "warning": "Recommendations only. A manager must confirm eligibility and approve any assignment change."})
+    except ValueError:
+        return "Date must use YYYY-MM-DD format."
     finally:
         db.close()
 

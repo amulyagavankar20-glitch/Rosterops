@@ -48,6 +48,33 @@ def test_employee_can_cover_multiple_processes_within_capacity(db):
     assert len(on_day)==2
     assert all(r['status']=='ok' for r in result['coverage_report'] if r['date']=='2026-11-02')
 
+
+def test_rebuild_preserves_manual_allocations(db):
+    emp, brand, process = setup_entities(db)
+    manual_date = date(2026, 11, 3)
+    db.add(RosterAllocation(
+        employee_id=emp.id, brand_id=brand.id, process_id=process.id,
+        date=manual_date, workload_units=1, source="manual",
+    ))
+    db.commit()
+    generate_roster(db, 2026, 11, clear_existing=True)
+    manual = db.query(RosterAllocation).filter(
+        RosterAllocation.date == manual_date,
+        RosterAllocation.source == "manual",
+    ).all()
+    assert len(manual) == 1
+
+
+def test_backup_recommendation_classifies_process_ineligibility(db):
+    emp, brand, process = setup_entities(db)
+    backup = Employee(name="Backup", pod_id=emp.pod_id, daily_capacity=2)
+    db.add(backup)
+    db.commit()
+    from app.scheduler import get_backup_recommendations
+    result = get_backup_recommendations(db, brand.id, process.id, date(2026, 11, 10))
+    assert result["recommendations"][0]["employee"] == "Backup"
+    assert "eligibility" in result["recommendations"][0]["reason"]
+
 def test_daily_capacity_prevents_overallocation(db):
     emp,brand,p1=setup_entities(db,capacity=1)
     p2=Process(name='ACC',brand_id=brand.id,min_staffing=1); db.add(p2); db.flush()

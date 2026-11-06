@@ -81,10 +81,13 @@ def generate_roster(db: Session, year: int, month: int, clear_existing: bool = T
     manual_pins = defaultdict(list)
     # In read-only validation mode, preserve manager-entered allocations as pinned
     # decisions and validate the rest of the roster around them.
-    if not clear_existing:
-        for pinned in db.query(RosterAllocation).filter(RosterAllocation.date >= start, RosterAllocation.date <= end, RosterAllocation.source == "manual").all():
-            manual_pins[(pinned.date, pinned.brand_id, pinned.process_id)].append(pinned.employee_id)
-            daily_load[(pinned.employee_id, pinned.date)] += pinned.workload_units
+    for pinned in db.query(RosterAllocation).filter(
+        RosterAllocation.date >= start,
+        RosterAllocation.date <= end,
+        RosterAllocation.source == "manual",
+    ).all():
+        manual_pins[(pinned.date, pinned.brand_id, pinned.process_id)].append(pinned.employee_id)
+        daily_load[(pinned.employee_id, pinned.date)] += pinned.workload_units
 
     for d, brand_id, process_id, required, mode, employee_links in demands:
         brand, process = brands[brand_id], processes[process_id]
@@ -136,20 +139,32 @@ def generate_roster(db: Session, year: int, month: int, clear_existing: bool = T
                 else:
                     reason = "not selected by allocation priority"
                 unavailable.append({"employee": emp.name, "reason": reason})
+            backup_options = get_backup_recommendations(
+                db, brand_id, process_id, d, required - len(selected)
+            )
             conflicts.append({"type": "coverage_gap", "severity": "critical" if not selected else "warning",
                 "date": d.isoformat(), "brand": brand.name, "brand_id": brand_id,
                 "process": process.name, "process_id": process_id, "required": required,
                 "available": len(selected), "available_names": row["available_names"],
                 "message": f"{brand.name} / {process.name} requires {required} on {d.isoformat()}, allocated {len(selected)}.",
                 "candidate_diagnostics": unavailable,
-                "suggested_actions": _backup_recommendations(db, brand_id, process_id, d, required-len(selected), employee_by_id, daily_load, leave_map)})
+                "suggested_actions": backup_options["recommendations"]})
 
     # Persist as one transaction after calculation. No partial delete/commit.
     if clear_existing:
-        db.query(RosterAllocation).filter(RosterAllocation.date >= start, RosterAllocation.date <= end).delete(synchronize_session=False)
+        db.query(RosterAllocation).filter(
+            RosterAllocation.date >= start,
+            RosterAllocation.date <= end,
+            RosterAllocation.source != "manual",
+        ).delete(synchronize_session=False)
         db.query(RosterEntry).filter(RosterEntry.date >= start, RosterEntry.date <= end).delete(synchronize_session=False)
         db.add_all(allocations)
         allocation_keys = {(a.employee_id, a.date) for a in allocations}
+        allocation_keys.update(
+            (employee_id, allocation_date)
+            for (allocation_date, _, _), employee_ids in manual_pins.items()
+            for employee_id in employee_ids
+        )
         for emp in employees:
             for d in dates:
                 if any(a <= d <= b for a, b in leave_map.get(emp.id, [])):
@@ -175,22 +190,101 @@ def generate_roster(db: Session, year: int, month: int, clear_existing: bool = T
     return {"summary": summary, "conflicts": conflicts, "coverage_report": coverage}
 
 
+def get_backup_recommendations(db: Session, brand_id: int, process_id: int, d: date, shortage: int = 1):
+    employees = db.query(Employee).order_by(Employee.id).all()
+    employee_by_id = {employee.id: employee for employee in employees}
+    leave_map = _approved_leave_map(db, d, d)
+    daily_load = defaultdict(int)
+    for allocation in db.query(RosterAllocation).filter(RosterAllocation.date == d).all():
+        daily_load[(allocation.employee_id, d)] += allocation.workload_units
+    result = _backup_recommendations(
+        db, brand_id, process_id, d, shortage, employee_by_id, daily_load, leave_map
+    )
+    result["recommendations"] = result["eligible"] + result["potential"]
+    return result
+
+
 def _backup_recommendations(db, brand_id, process_id, d, shortage, employee_by_id, daily_load, leave_map):
-    # Recommend employees in the same pod/brand ecosystem who are not already assigned that day.
-    assigned_ids = {a.employee_id for a in db.query(Assignment).filter(Assignment.brand_id == brand_id).all()}
-    assigned_pods = {employee_by_id[i].pod_id for i in assigned_ids if i in employee_by_id}
-    recs = []
+    """Return explainable, validated backup recommendations."""
+    brand = db.query(Brand).filter(Brand.id == brand_id).first()
+    process = db.query(Process).filter(Process.id == process_id).first()
+    if not brand or not process:
+        return {"eligible": [], "potential": [], "rejected": [], "recommendations": [], "shortage": shortage}
+
+    assigned_ids = {
+        a.employee_id for a in db.query(Assignment).filter(Assignment.brand_id == brand_id).all()
+    }
+    process_assigned_ids = {
+        a.employee_id for a in db.query(Assignment).filter(Assignment.process_id == process_id).all()
+    }
+    assigned_pods = {
+        employee_by_id[employee_id].pod_id
+        for employee_id in assigned_ids
+        if employee_id in employee_by_id
+    }
+    process_name = process.name.casefold()
+    holidays = {
+        holiday.date
+        for holiday in db.query(PublicHoliday).filter(PublicHoliday.date == d).all()
+    }
+    if not is_operating_day(d, process.operating_mode or brand.operating_mode, holidays):
+        return {"eligible": [], "potential": [], "rejected": [], "recommendations": [], "shortage": shortage}
+    existing_allocations = defaultdict(int)
+    for allocation in db.query(RosterAllocation).filter(RosterAllocation.date == d).all():
+        existing_allocations[allocation.employee_id] += allocation.workload_units
+
+    eligible = []
+    potential = []
+    rejected = []
     for emp in employee_by_id.values():
-        if emp.id in assigned_ids or emp.pod_id not in assigned_pods:
+        if emp.id in process_assigned_ids:
             continue
-        if any(a <= d <= b for a, b in leave_map.get(emp.id, [])):
+        if emp.pod_id not in assigned_pods:
+            rejected.append({"employee": emp.name, "reason": "outside the assigned pod ecosystem"})
             continue
-        if daily_load[(emp.id, d)] >= max(1, emp.daily_capacity or 1):
+        if any(start <= d <= end for start, end in leave_map.get(emp.id, [])):
+            rejected.append({"employee": emp.name, "reason": "approved leave"})
             continue
-        recs.append({"employee_id": emp.id, "employee": emp.name, "pod_id": emp.pod_id,
-                     "current_load": daily_load[(emp.id, d)], "reason": "Same pod; no approved leave; capacity available",
-                     "requires_temporary_assignment": True})
-    return recs[:max(3, shortage)]
+        current_load = max(daily_load[(emp.id, d)], existing_allocations[emp.id])
+        if current_load >= max(1, emp.daily_capacity or 1):
+            rejected.append({"employee": emp.name, "reason": "daily capacity already allocated"})
+            continue
+        process_capable = any(
+            assignment.process and assignment.process.name.casefold() == process_name
+            for assignment in emp.assignments
+        )
+        if d.strftime("%A") == (emp.preferred_weekly_off or "Sunday"):
+            potential.append({
+                "employee_id": emp.id,
+                "employee": emp.name,
+                "pod_id": emp.pod_id,
+                "current_load": current_load,
+                "capacity": max(1, emp.daily_capacity or 1),
+                "reason": "same pod and capacity available, but date is a preferred weekly off",
+                "requires_temporary_assignment": True,
+            })
+            continue
+        recommendation = {
+            "employee_id": emp.id,
+            "employee": emp.name,
+            "pod_id": emp.pod_id,
+            "current_load": current_load,
+            "capacity": max(1, emp.daily_capacity or 1),
+            "requires_temporary_assignment": True,
+        }
+        if process_capable:
+            recommendation["reason"] = "same pod, eligible for this process, no leave, and capacity available"
+            eligible.append(recommendation)
+        else:
+            recommendation["reason"] = "same pod and capacity available, but process eligibility requires reassignment"
+            potential.append(recommendation)
+
+    return {
+        "eligible": eligible[:max(3, shortage)],
+        "potential": potential[:max(3, shortage)],
+        "rejected": rejected[:10],
+        "shortage": shortage,
+    }
 
 
 def analyze_leave_impact(db: Session, employee_id: int, start_date: date, end_date: date) -> dict:
@@ -224,6 +318,8 @@ def apply_leave_and_revalidate(db: Session, employee_id: int, start_date: date, 
     """Compatibility function: create a pending request, never auto-approve it."""
     from app.models import LeaveRequest
     if end_date < start_date: return {"error": "End date must be on or after start date"}
+    if leave_type not in {"planned", "sick", "comp_off"}:
+        return {"error": "Leave type must be planned, sick, or comp_off"}
     emp = db.query(Employee).filter(Employee.id == employee_id).first()
     if not emp: return {"error": "Employee not found"}
     impact = analyze_leave_impact(db, employee_id, start_date, end_date)
@@ -240,13 +336,14 @@ def review_leave_request(db: Session, request_id: int, approve: bool, reviewer: 
     if not request: return {"error": "Leave request not found"}
     if request.status != "pending": return {"error": f"Request is already {request.status}"}
     request.status = "approved" if approve else "rejected"
-    request.reviewed_at = __import__('datetime').datetime.now(__import__('datetime').timezone.utc); request.reviewer = reviewer
+    request.reviewed_at = __import__('datetime').datetime.now(__import__('datetime').timezone.utc)
+    request.reviewer = reviewer
     if approve:
         db.add(Leave(employee_id=request.employee_id, start_date=request.start_date, end_date=request.end_date,
                      leave_type=request.leave_type, status="approved", notes=f"Approved request #{request.id}"))
     db.add(AuditEvent(event_type="leave_approved" if approve else "leave_rejected", entity_type="leave_request",
                       entity_id=request.id, actor=reviewer, details=request.status))
-    db.commit()
+    db.flush()
     impacts = []
     if approve:
         cursor = date(request.start_date.year, request.start_date.month, 1)
@@ -254,6 +351,7 @@ def review_leave_request(db: Session, request_id: int, approve: bool, reviewer: 
         while cursor <= last:
             impacts.append(generate_roster(db, cursor.year, cursor.month, clear_existing=True))
             cursor = date(cursor.year + (1 if cursor.month == 12 else 0), 1 if cursor.month == 12 else cursor.month + 1, 1)
+    db.commit()
     return {"request_id": request.id, "status": request.status, "revalidation": impacts}
 
 
